@@ -7,7 +7,8 @@ Usage:
 
 Key bindings:
     ↑ / ↓         Navigate list
-    Enter          Open directory
+    Enter          Open directory / navigate to search result
+    Ctrl+F         Open fuzzy search bar
     Space          Toggle selection on highlighted item
     A              Select / deselect all items in current directory
     D              Download selected items (recursive for dirs; prompts size first)
@@ -16,7 +17,14 @@ Key bindings:
     R              Refresh current directory
     C              Copy current URL to clipboard
     Backspace      Go up one directory
+    Esc            Close search bar
     Q              Quit
+
+Search bar (Ctrl+F):
+    Typing instantly fuzzy-filters the current directory.
+    Pressing Enter launches a deep recursive search from the current directory.
+    Clicking or pressing Enter on a result navigates to its parent folder.
+    Space / D work normally on search results to select+download.
 
 Downloads are written to ./downloads/ (mirroring the remote path) by default.
 You may run the program with `--dest /some/path` (or `-d`) to change this root.
@@ -39,6 +47,7 @@ from textual.widgets import (
     DataTable,
     Footer,
     Header,
+    Input,
     Label,
     Static,
     Tree,
@@ -51,6 +60,41 @@ from scraper import Entry, BASE_URL, format_size, fetch_directory
 # ── Activity Panel ────────────────────────────────────────────────────────────
 
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _fuzzy_score(query: str, text: str) -> int:
+    """
+    Return a match score > 0 if *query* fuzzy-matches *text*, else 0.
+    Higher score = better match.
+
+    Strategy (in order):
+    1. Exact substring                   → 10 000 – len(text)
+    2. ALL space-split words present     → 5 000
+    3. ANY word present                  → 1 000 per word
+    4. ≥70 % of chars appear in order    → 100 + qi*10  (min query len 3)
+    """
+    q = query.lower().strip()
+    t = text.lower()
+    if not q:
+        return 1
+    if q in t:
+        return max(1, 10000 - len(t))
+    words = q.split()
+    if all(w in t for w in words):
+        return 5000
+    hits = sum(1 for w in words if w in t)
+    if hits:
+        return 1000 * hits
+    # Character-sequence fallback (only for longer queries)
+    if len(q) < 3:
+        return 0
+    qi = 0
+    for ch in t:
+        if qi < len(q) and ch == q[qi]:
+            qi += 1
+    if qi >= max(1, int(len(q) * 0.7)):
+        return 100 + qi * 10
+    return 0
 
 
 def _prog_bar(done: int, total: int, width: int = 24) -> str:
@@ -398,10 +442,28 @@ class MyrientBrowser(App):
         padding: 0 1;
         display: none;
     }
+
+    #search-input {
+        display: none;
+        height: 3;
+        border: solid $accent;
+        background: $surface;
+        padding: 0 1;
+    }
+
+    #search-label {
+        height: 1;
+        background: $accent-darken-2;
+        color: $text;
+        padding: 0 1;
+        display: none;
+    }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
+        Binding("ctrl+f", "open_search", "Search"),
+        Binding("escape", "close_search", "Close Search", show=False),
         Binding("r", "refresh", "Refresh"),
         Binding("space", "toggle_select", "Select"),
         Binding("a", "select_all", "Sel All"),
@@ -426,6 +488,11 @@ class MyrientBrowser(App):
     _name_col_key: object
     # Destination root for downloads
     _download_dir: str = "downloads"
+    # Search state
+    _search_mode: bool = False
+    _browse_url_saved: str = BASE_URL
+    _browse_entries_saved: list  # list[Entry], saved when entering search
+    _result_parent_urls: list   # list[str], parallel to _current_entries in search mode
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -450,6 +517,11 @@ class MyrientBrowser(App):
             # Right: file listing
             with Vertical(id="files-panel"):
                 yield Label(" /files/", id="files-title")
+                yield Input(
+                    placeholder="  Type to filter  ·  Enter = deep recursive search  ·  Esc = close",
+                    id="search-input",
+                )
+                yield Label("", id="search-label")
                 table = DataTable(id="file-table", cursor_type="row")
                 col_keys = table.add_columns("Name", "Size", "Date", "Type")
                 self._name_col_key = col_keys[0]
@@ -465,6 +537,10 @@ class MyrientBrowser(App):
     def on_mount(self) -> None:
         """Load the root directory when the app starts."""
         self._selected_keys = set()
+        self._search_mode = False
+        self._browse_url_saved = BASE_URL
+        self._browse_entries_saved = []
+        self._result_parent_urls = []
         self._load_into_tree(self.query_one("#dir-tree", Tree).root)
         self._load_table(BASE_URL)
 
@@ -510,8 +586,26 @@ class MyrientBrowser(App):
             entry = entries[idx]
             self._selected_entry = entry
             self._update_status_selection(entry)
+
+            if self._search_mode:
+                # Navigate to the result: dirs open the dir, files open their parent
+                target_url = entry.url if entry.is_dir else (
+                    self._result_parent_urls[idx]
+                    if idx < len(self._result_parent_urls)
+                    else self._browse_url_saved
+                )
+                # Exit search mode
+                self.query_one("#search-input", Input).display = False
+                self.query_one("#search-label", Label).display = False
+                self._search_mode = False
+                self._result_parent_urls = []
+                self._current_url = target_url
+                self._load_table(target_url)
+                self._sync_tree_selection(target_url)
+                return
+
             if entry.is_dir:
-                # Navigate into the directory
+                # Normal browse navigation
                 self._current_url = entry.url
                 self._load_table(entry.url)
                 self._sync_tree_selection(entry.url)
@@ -527,6 +621,39 @@ class MyrientBrowser(App):
                 self._selected_entry = e
                 self._update_status_selection(e)
                 break
+
+    # ── Search input events ───────────────────────────────────────────────────
+
+    @on(Input.Changed, "#search-input")
+    def on_search_input_changed(self, event: Input.Changed) -> None:
+        """Live-filter current directory entries as the user types."""
+        query = event.value.strip()
+        if not query:
+            # Restore the saved browse view (cached, instant)
+            self._search_mode = False
+            self._result_parent_urls = []
+            self.query_one("#search-label", Label).display = False
+            self._load_table(self._browse_url_saved)
+            return
+        scored = [
+            (e, _fuzzy_score(query, e.name))
+            for e in self._browse_entries_saved
+        ]
+        matches = [
+            (e, self._browse_url_saved)
+            for e, sc in sorted(scored, key=lambda t: t[1], reverse=True)
+            if sc > 0
+        ]
+        self._show_search_results(matches, query)
+
+    @on(Input.Submitted, "#search-input")
+    def on_search_input_submitted(self, event: Input.Submitted) -> None:
+        """Launch a deep recursive search when Enter is pressed."""
+        query = event.value.strip()
+        if not query:
+            self.action_close_search()
+            return
+        self._run_deep_search(query, self._browse_url_saved)
 
     # ── Key Actions ───────────────────────────────────────────────────────────
 
@@ -607,7 +734,13 @@ class MyrientBrowser(App):
             self._selected_keys.discard(rk)
         else:
             self._selected_keys.add(rk)
-        name_val = self._make_name_cell(entry, rk in self._selected_keys)
+        is_sel = rk in self._selected_keys
+        if self._search_mode and idx < len(self._result_parent_urls):
+            name_val = self._make_search_name_cell(
+                entry, self._result_parent_urls[idx], is_sel
+            )
+        else:
+            name_val = self._make_name_cell(entry, is_sel)
         table.update_cell(rk, self._name_col_key, name_val)
         self._update_select_status()
 
@@ -640,6 +773,35 @@ class MyrientBrowser(App):
             return
 
         self._run_download(targets, self._download_dir)
+
+    def action_open_search(self) -> None:
+        """Open the fuzzy search bar."""
+        search_input = self.query_one("#search-input", Input)
+        if not search_input.display:
+            # Save current browse position before entering search mode
+            if not self._search_mode:
+                self._browse_url_saved = self._current_url
+                self._browse_entries_saved = list(self._current_entries)
+            search_input.display = True
+        search_input.value = ""
+        search_input.focus()
+        self.query_one("#files-title", Label).update(
+            " \U0001f50d Search  [dim](type to filter  \u00b7  Enter = deep search  \u00b7  Esc = close)[/]"
+        )
+
+    def action_close_search(self) -> None:
+        """Close the search bar and restore the browse view."""
+        search_input = self.query_one("#search-input", Input)
+        search_label = self.query_one("#search-label", Label)
+        search_input.display = False
+        search_label.display = False
+        if self._search_mode:
+            self._search_mode = False
+            self._result_parent_urls = []
+            # Restore browse state via cached fetch
+            self._load_table(self._browse_url_saved)
+        else:
+            self.query_one("#file-table", DataTable).focus()
 
     # ── Workers (async background tasks) ─────────────────────────────────────
 
@@ -902,6 +1064,73 @@ class MyrientBrowser(App):
         )
         sb.status_msg = f"Done — {summary}  → {dest_root}/"
 
+    @work(exclusive=False, thread=False)
+    async def _run_deep_search(self, query: str, base_url: str) -> None:
+        """
+        Recursively crawl the archive from *base_url* and collect every entry
+        whose name fuzzy-matches *query*.  Results are streamed into the table
+        via _show_search_results() once the crawl is done.
+        """
+        panel = self.query_one("#activity-panel", ActivityPanel)
+        search_label = self.query_one("#search-label", Label)
+        task_id = "search"
+        panel.add_task(task_id, f"[bold]Search:[/] scanning for [italic]{query}[/]\u2026")
+
+        results: list[tuple] = []   # (Entry, parent_url)
+        visited: set[str] = set()
+        dirs_scanned = [0]
+        sem = asyncio.Semaphore(8)  # up to 8 concurrent directory fetches
+
+        async def _scan(url: str) -> None:
+            if url in visited:
+                return
+            visited.add(url)
+            async with sem:
+                dirs_scanned[0] += 1
+                panel.update_task(
+                    task_id,
+                    f"[bold]Search:[/] [italic]{query}[/]  \u2014  "
+                    f"{dirs_scanned[0]} dirs, {len(results)} matches\u2026",
+                )
+                try:
+                    entries = await fetch_directory(url)
+                except Exception:
+                    return
+            sub: list = []
+            for entry in entries:
+                if _fuzzy_score(query, entry.name) > 0:
+                    results.append((entry, url))
+                if entry.is_dir:
+                    sub.append(_scan(entry.url))
+            if sub:
+                await asyncio.gather(*sub)
+
+        await _scan(base_url)
+        panel.finish_task(task_id)
+
+        if not self._search_mode:
+            # User pressed Esc before the crawl finished — discard results
+            return
+
+        # Sort: files first (ROMs), then directories; within each group by score desc
+        results.sort(
+            key=lambda t: (t[0].is_dir, -_fuzzy_score(query, t[0].name))
+        )
+        results = results[:300]  # cap at 300 results
+
+        if results:
+            self._show_search_results(results, query)
+            self.notify(
+                f"{len(results)} result{'s' if len(results) != 1 else ''} for {query!r}",
+                severity="information",
+            )
+        else:
+            search_label.update(
+                f"[dim]No results for [/][bold]{query!r}[/][dim]  \u2014  Esc to go back[/]"
+            )
+            search_label.display = True
+            self.notify(f"No results for {query!r}", severity="warning")
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _make_name_cell(self, entry: Entry, selected: bool) -> str:
@@ -910,12 +1139,77 @@ class MyrientBrowser(App):
         check = "[bold green]✓[/] " if selected else "  "
         return f"{check}{icon} {entry.display_name}"
 
+    def _make_search_name_cell(self, entry: Entry, parent_url: str, selected: bool) -> str:
+        """Build a Name cell for a search result with its directory path prefix."""
+        from urllib.parse import urlparse
+        icon = "\U0001f4c1" if entry.is_dir else _file_icon(entry.name)
+        check = "[bold green]✓[/] " if selected else "  "
+        try:
+            path = urlparse(parent_url).path.lstrip("/")
+            if path.startswith("files/"):
+                path = path[len("files/"):]
+            path = path.rstrip("/")
+        except Exception:
+            path = ""
+        path_str = f"[dim cyan]{path}/[/] " if path else ""
+        return f"{check}{icon} {path_str}{entry.display_name}"
+
+    def _show_search_results(
+        self,
+        results: list,
+        query: str,
+    ) -> None:
+        """Populate the DataTable with (Entry, parent_url) search results."""
+        table = self.query_one("#file-table", DataTable)
+        title_label = self.query_one("#files-title", Label)
+        search_label = self.query_one("#search-label", Label)
+        sb = self.query_one("#status-bar", StatusBar)
+
+        table.clear()
+        self._search_mode = True
+        self._current_entries = [r[0] for r in results]
+        self._result_parent_urls = [r[1] for r in results]
+        self._selected_keys = set()
+
+        n = len(results)
+        title_label.update(f" \U0001f50d {query!r}  —  {n} result{'s' if n != 1 else ''}")
+        search_label.update(
+            "[dim]Enter[/]=deep search  [dim]Esc[/]=back  "
+            "[dim]Space[/]=select  [dim]D[/]=download  "
+            "[dim]Enter on row[/]=navigate to folder"
+        )
+        search_label.display = True
+        sb.current_path = f"\U0001f50d {query!r}"
+        sb.file_count = sum(1 for e, _ in results if not e.is_dir)
+        sb.dir_count = sum(1 for e, _ in results if e.is_dir)
+        sb.status_msg = f"{n} result{'s' if n != 1 else ''} for {query!r}"
+
+        for i, (entry, parent_url) in enumerate(results):
+            name_cell = self._make_search_name_cell(entry, parent_url, False)
+            if entry.is_dir:
+                size_cell = "[dim cyan]—[/]"
+                type_cell = "[cyan]DIR[/]"
+            else:
+                sz = entry.size_bytes
+                size_cell = _size_colored(sz) if sz is not None else "[dim]?[/]"
+                ext = entry.name.rsplit(".", 1)[-1].upper() if "." in entry.name else "—"
+                type_cell = f"[dim]{ext}[/]"
+            table.add_row(name_cell, size_cell, entry.date or "—", type_cell, key=str(i))
+
+        table.focus()
+
     def _refresh_name_cells(self) -> None:
         """Redraw the Name column for every entry row to reflect current selections."""
         table = self.query_one("#file-table", DataTable)
         for i, entry in enumerate(self._current_entries):
             rk = str(i)
-            name_val = self._make_name_cell(entry, rk in self._selected_keys)
+            is_sel = rk in self._selected_keys
+            if self._search_mode and i < len(self._result_parent_urls):
+                name_val = self._make_search_name_cell(
+                    entry, self._result_parent_urls[i], is_sel
+                )
+            else:
+                name_val = self._make_name_cell(entry, is_sel)
             try:
                 table.update_cell(rk, self._name_col_key, name_val)
             except Exception:
