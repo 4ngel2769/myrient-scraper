@@ -18,7 +18,8 @@ Key bindings:
     Backspace      Go up one directory
     Q              Quit
 
-Downloads are written to ./downloads/ (mirroring the remote path).
+Downloads are written to ./downloads/ (mirroring the remote path) by default.
+You may run the program with `--dest /some/path` (or `-d`) to change this root.
 Already-downloaded files at the correct size are skipped automatically.
 """
 
@@ -1013,5 +1014,21 @@ def _size_colored(size: int) -> str:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Browse and download from the Myrient archive TUI",
+    )
+    parser.add_argument(
+        "--dest",
+        "-d",
+        metavar="DIR",
+        default="downloads",
+        help="root directory to write downloads into (default: %(default)s)",
+    )
+    args = parser.parse_args()
+
     app = MyrientBrowser()
+    # allow overriding the default destination
+    app._download_dir = args.dest
     app.run()
