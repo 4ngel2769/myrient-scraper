@@ -1000,43 +1000,49 @@ class MyrientBrowser(App):
         finally:
             panel.finish_task(task_id)
 
-    @work(exclusive=False, thread=False)
+    @work(exclusive=False, thread=True)
     async def _run_download(self, targets: list[Entry], dest_root: str) -> None:
         """Collect files, then stream-download with per-file byte progress."""
         from urllib.parse import unquote, urlparse
 
-        sb = self.query_one("#status-bar", StatusBar)
-        panel = self.query_one("#activity-panel", ActivityPanel)
-        dl_panel = self.query_one("#download-panel", DownloadPanel)
+        sb = self.call_from_thread(lambda: self.query_one("#status-bar", StatusBar))
+        panel = self.call_from_thread(lambda: self.query_one("#activity-panel", ActivityPanel))
+        dl_panel = self.call_from_thread(lambda: self.query_one("#download-panel", DownloadPanel))
         task_id = "download"
 
-        panel.add_task(task_id, "[bold]Download:[/] collecting file list…")
+        self.call_from_thread(lambda: panel.add_task(task_id, "[bold]Download:[/] collecting file list…"))
 
         # Expand all targeted dirs into individual file entries
         all_files: list[Entry] = []
         for entry in targets:
             if entry.is_dir:
-                panel.update_task(
-                    task_id,
-                    f"[bold]Download:[/] scanning [italic]{entry.display_name}[/]…",
+                self.call_from_thread(
+                    lambda e=entry: panel.update_task(
+                        task_id,
+                        f"[bold]Download:[/] scanning [italic]{e.display_name}[/]…",
+                    )
                 )
                 sub = await scraper.collect_files(entry.url)
                 all_files.extend(sub)
             else:
                 all_files.append(entry)
 
-        panel.finish_task(task_id)
+        self.call_from_thread(lambda: panel.finish_task(task_id))
 
         if not all_files:
-            sb.status_msg = "No files found to download."
+            self.call_from_thread(lambda: setattr(sb, "status_msg", "No files found to download."))
             return
 
         total_count = len(all_files)
         total_bytes = sum(e.size_bytes for e in all_files if e.size_bytes is not None)
-        dl_panel.start(total_count, total_bytes, dest_root)
-        sb.status_msg = (
-            f"Downloading {total_count} files  "
-            f"({format_size(total_bytes)})  → {dest_root}/"
+        self.call_from_thread(lambda: dl_panel.start(total_count, total_bytes, dest_root))
+        self.call_from_thread(
+            lambda: setattr(
+                sb,
+                "status_msg",
+                f"Downloading {total_count} files  "
+                f"({format_size(total_bytes)})  → {dest_root}/",
+            )
         )
 
         def _folder_label(url: str) -> str:
@@ -1057,28 +1063,38 @@ class MyrientBrowser(App):
             key = entry.url
             folder = _folder_label(key)
             async with sem:
-                dl_panel.file_start(key, entry.name, folder, entry.size_bytes or 0)
+                self.call_from_thread(
+                    lambda: dl_panel.file_start(key, entry.name, folder, entry.size_bytes or 0)
+                )
                 try:
                     def _progress(done_bytes: int, total_bytes: int) -> None:
-                        dl_panel.file_progress(key, done_bytes, total_bytes)
+                        self.call_from_thread(
+                            lambda d=done_bytes, t=total_bytes: dl_panel.file_progress(key, d, t)
+                        )
 
                     was_skipped = await scraper.download_entry(
                         entry, dest_root, progress_callback=_progress
                     )
                     counters["skipped"] += int(was_skipped)
-                    dl_panel.file_done(key, skipped=was_skipped, error=False)
+                    self.call_from_thread(
+                        lambda s=was_skipped: dl_panel.file_done(key, skipped=s, error=False)
+                    )
                 except Exception as exc:
                     counters["errors"] += 1
-                    dl_panel.file_done(key, skipped=False, error=True)
-                    self.notify(
-                        f"Failed: {entry.name}\n{exc}",
-                        title="Download error",
-                        severity="warning",
+                    self.call_from_thread(
+                        lambda: dl_panel.file_done(key, skipped=False, error=True)
+                    )
+                    self.call_from_thread(
+                        lambda e=exc: self.notify(
+                            f"Failed: {entry.name}\n{e}",
+                            title="Download error",
+                            severity="warning",
+                        )
                     )
 
         await asyncio.gather(*[_dl(e) for e in all_files])
 
-        dl_panel.finish()
+        self.call_from_thread(lambda: dl_panel.finish())
 
         n_err = counters["errors"]
         n_skip = counters["skipped"]
@@ -1088,14 +1104,16 @@ class MyrientBrowser(App):
             summary += f"  +  {n_skip} skipped"
         if n_err:
             summary += f"  +  {n_err} errors"
-        self.notify(
-            f"{summary}\n→ {dest_root}/",
-            title="Download complete" if not n_err else "Download finished with errors",
-            severity="information" if not n_err else "warning",
+        self.call_from_thread(
+            lambda: self.notify(
+                f"{summary}\n→ {dest_root}/",
+                title="Download complete" if not n_err else "Download finished with errors",
+                severity="information" if not n_err else "warning",
+            )
         )
-        sb.status_msg = f"Done — {summary}  → {dest_root}/"
+        self.call_from_thread(lambda: setattr(sb, "status_msg", f"Done — {summary}  → {dest_root}/"))
 
-    @work(exclusive=False, thread=False)
+    @work(exclusive=False, thread=True)
     async def _build_site_index(self) -> None:
         """
         Crawl the entire Myrient archive and build an in-memory index of every
@@ -1108,9 +1126,9 @@ class MyrientBrowser(App):
         self._index_building = True
         self._index = []
 
-        panel = self.query_one("#activity-panel", ActivityPanel)
+        panel = self.call_from_thread(lambda: self.query_one("#activity-panel", ActivityPanel))
         task_id = "site_index"
-        panel.add_task(task_id, "[bold]Indexing:[/] connecting to archive\u2026")
+        self.call_from_thread(lambda: panel.add_task(task_id, "[bold]Indexing:[/] connecting to archive\u2026"))
 
         visited: set[str] = set()
         sem = asyncio.Semaphore(20)
@@ -1123,10 +1141,12 @@ class MyrientBrowser(App):
             async with sem:
                 dirs_scanned[0] += 1
                 if dirs_scanned[0] % 20 == 0:
-                    panel.update_task(
-                        task_id,
-                        f"[bold]Indexing:[/] "
-                        f"{dirs_scanned[0]} dirs  \u00b7  {len(self._index):,} entries\u2026",
+                    self.call_from_thread(
+                        lambda n=dirs_scanned[0]: panel.update_task(
+                            task_id,
+                            f"[bold]Indexing:[/] "
+                            f"{n} dirs  \u00b7  {len(self._index):,} entries\u2026",
+                        )
                     )
                 try:
                     entries = await fetch_directory(url)
@@ -1143,17 +1163,22 @@ class MyrientBrowser(App):
         try:
             await _scan(BASE_URL)
             self._index_ready = True
-            panel.finish_task(task_id)
+            self.call_from_thread(lambda: panel.finish_task(task_id))
             n = len(self._index)
-            self.notify(
-                f"{n:,} entries indexed — Ctrl+F to search",
-                title="Index ready",
-                severity="information",
+            self.call_from_thread(
+                lambda: self.notify(
+                    f"{n:,} entries indexed — Ctrl+F to search",
+                    title="Index ready",
+                    severity="information",
+                )
             )
             # If the search bar is open, refresh results with the full index
-            search_input = self.query_one("#search-input", Input)
-            if self._search_mode and search_input.display:
-                q = search_input.value.strip()
+            search_input = self.call_from_thread(
+                lambda: self.query_one("#search-input", Input)
+            )
+            is_visible = self.call_from_thread(lambda: search_input.display)
+            if self._search_mode and is_visible:
+                q = self.call_from_thread(lambda: search_input.value.strip())
                 if q:
                     scored = [
                         (e, pu, _fuzzy_score(q, e.name))
@@ -1164,10 +1189,12 @@ class MyrientBrowser(App):
                         for e, pu, sc in sorted(scored, key=lambda t: t[2], reverse=True)
                         if sc > 0
                     ][:500]
-                    self._show_search_results(matches, q)
+                    self.call_from_thread(lambda: self._show_search_results(matches, q))
         except Exception as exc:
-            panel.finish_task(task_id)
-            self.notify(str(exc), title="Indexing error", severity="error")
+            self.call_from_thread(lambda: panel.finish_task(task_id))
+            self.call_from_thread(
+                lambda: self.notify(str(exc), title="Indexing error", severity="error")
+            )
         finally:
             self._index_building = False
 
