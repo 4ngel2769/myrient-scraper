@@ -25,6 +25,7 @@ Already-downloaded files at the correct size are skipped automatically.
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -38,7 +39,6 @@ from textual.widgets import (
     Footer,
     Header,
     Label,
-    ProgressBar,
     Static,
     Tree,
 )
@@ -72,8 +72,8 @@ class ActivityPanel(Static):
     """
 
     # task_id -> {"spin": int, "text": str}
-    def __init__(self) -> None:
-        super().__init__("")
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__("", *args, **kwargs)
         self._tasks: dict[str, dict] = {}
 
     def add_task(self, task_id: str, text: str) -> None:
@@ -107,6 +107,152 @@ class ActivityPanel(Static):
         for d in self._tasks.values():
             spin = _SPINNER_FRAMES[d["spin"]]
             lines.append(f" [cyan]{spin}[/]  {d['text']}")
+        self.update("\n".join(lines))
+
+
+# ── Download Panel ────────────────────────────────────────────────────────────
+
+class DownloadPanel(Static):
+    """
+    Dedicated download progress panel.  Hidden when no download is running.
+    Shows:
+      • Overall file-count bar + bytes bar
+      • Per-active-file bars with folder label, filename, bytes done / total
+      • Skipped / error counters
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__("", *args, **kwargs)
+        self._total_files = 0
+        self._total_bytes = 0
+        self._done_files = 0
+        self._done_bytes = 0
+        self._skipped = 0
+        self._errors = 0
+        self._dest_root = ""
+        self._active: dict[str, dict] = {}  # key -> {name, folder, done, total, spin}
+        self._spin_global = 0
+        self._last_rebuild = 0.0
+
+    def start(self, total_files: int, total_bytes: int, dest_root: str) -> None:
+        self._total_files = total_files
+        self._total_bytes = total_bytes
+        self._done_files = 0
+        self._done_bytes = 0
+        self._skipped = 0
+        self._errors = 0
+        self._dest_root = dest_root
+        self._active = {}
+        self._spin_global = 0
+        self._last_rebuild = 0.0
+        self.display = True
+        self._rebuild(force=True)
+
+    def file_start(self, key: str, name: str, folder: str, total_bytes: int) -> None:
+        self._active[key] = {
+            "name": name,
+            "folder": folder,
+            "done": 0,
+            "total": total_bytes,
+            "spin": 0,
+        }
+        self._rebuild(force=True)
+
+    def file_progress(self, key: str, done_bytes: int, total_bytes: int) -> None:
+        """Called synchronously from the download chunk loop."""
+        if key not in self._active:
+            return
+        d = self._active[key]
+        delta = done_bytes - d["done"]
+        if delta <= 0:
+            return
+        d["done"] = done_bytes
+        if total_bytes > 0:
+            d["total"] = total_bytes
+        self._done_bytes += delta
+        # Throttle redraws: at most ~12 fps, or when ≥512 KiB moved
+        now = time.monotonic()
+        if delta >= 512 * 1024 or (now - self._last_rebuild) >= 0.083:
+            self._spin_global = (self._spin_global + 1) % len(_SPINNER_FRAMES)
+            d["spin"] = self._spin_global
+            self._rebuild()
+
+    def file_done(self, key: str, skipped: bool = False, error: bool = False) -> None:
+        if key in self._active:
+            d = self._active.pop(key)
+            # Ensure byte counter is accurate when size was unknown
+            if not skipped and not error and d["total"] > d["done"]:
+                self._done_bytes += d["total"] - d["done"]
+        self._done_files += 1
+        if skipped:
+            self._skipped += 1
+        if error:
+            self._errors += 1
+        self._rebuild(force=True)
+
+    def finish(self) -> None:
+        self.update("")
+        self.display = False
+
+    def _rebuild(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_rebuild) < 0.083:
+            return
+        self._last_rebuild = now
+
+        W = 28   # bar width for overall bars
+        Wf = 22  # bar width for per-file bars
+        SEP = "[dim]" + "─" * 72 + "[/]"
+        lines: list[str] = []
+
+        # ── Overall header ──────────────────────────────────────────────
+        done_f = self._done_files
+        total_f = self._total_files
+        pct_f = int(done_f / total_f * 100) if total_f else 0
+        lines.append(
+            f"[bold yellow]⬇  DOWNLOADING[/]  "
+            f"[bold]{done_f}[/][dim]/{total_f}[/] files  "
+            f"{_prog_bar(done_f, total_f, W)}  [bold]{pct_f}%[/]"
+        )
+        if self._total_bytes > 0:
+            pct_b = int(self._done_bytes / self._total_bytes * 100)
+            lines.append(
+                f"   [dim]data [/]{_prog_bar(self._done_bytes, self._total_bytes, W)}  "
+                f"[dim]{format_size(self._done_bytes)} / {format_size(self._total_bytes)}[/]  "
+                f"[bold]{pct_b}%[/]"
+            )
+        lines.append(f"   [dim]→ {self._dest_root}/[/]")
+        lines.append(SEP)
+
+        # ── Active files ───────────────────────────────────────────────
+        for d in list(self._active.values()):
+            spin = _SPINNER_FRAMES[d["spin"]]
+            raw = d["name"]
+            name = (raw[:52] + "…") if len(raw) > 53 else raw
+            folder = f"[dim cyan]{d['folder']}[/]  " if d["folder"] else ""
+            if d["total"] > 0:
+                pct = int(d["done"] / d["total"] * 100)
+                fbar = _prog_bar(d["done"], d["total"], Wf)
+                size_str = f"[dim]{format_size(d['done'])} / {format_size(d['total'])}[/]"
+                lines.append(f" [cyan]{spin}[/]  {folder}[bold]{name}[/]")
+                lines.append(f"      {fbar}  [bold]{pct}%[/]  {size_str}")
+            else:
+                lines.append(
+                    f" [cyan]{spin}[/]  {folder}[bold]{name}[/]  [dim]downloading…[/]"
+                )
+
+        # ── Footer counters ─────────────────────────────────────────────
+        parts: list[str] = []
+        active_n = len(self._active)
+        if active_n:
+            parts.append(f"[dim]{active_n} active[/]")
+        if self._skipped:
+            parts.append(f"[dim]{self._skipped} already downloaded[/]")
+        if self._errors:
+            parts.append(f"[bold red]{self._errors} errors[/]")
+        if parts:
+            lines.append("   " + "  ·  ".join(parts))
+
         self.update("\n".join(lines))
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -236,17 +382,19 @@ class MyrientBrowser(App):
 
     ActivityPanel {
         height: auto;
-        max-height: 10;
+        max-height: 6;
         background: $surface-darken-2;
         border-top: solid $accent;
         padding: 0 1;
         display: none;
     }
 
-    #download-progress {
-        height: 1;
+    DownloadPanel {
+        height: auto;
+        max-height: 22;
         background: $surface-darken-2;
-        padding: 0 2;
+        border-top: solid $warning;
+        padding: 0 1;
         display: none;
     }
     """
@@ -308,7 +456,7 @@ class MyrientBrowser(App):
 
         yield StatusBar(id="status-bar")
         yield ActivityPanel(id="activity-panel")
-        yield ProgressBar(total=100, id="download-progress", show_eta=False)
+        yield DownloadPanel(id="download-panel")
         yield Footer()
 
     # ── Startup ───────────────────────────────────────────────────────────────
@@ -660,10 +808,12 @@ class MyrientBrowser(App):
 
     @work(exclusive=False, thread=False)
     async def _run_download(self, targets: list[Entry], dest_root: str) -> None:
-        """Collect files from targets (expanding dirs recursively), check size, then download."""
+        """Collect files, then stream-download with per-file byte progress."""
+        from urllib.parse import unquote, urlparse
+
         sb = self.query_one("#status-bar", StatusBar)
         panel = self.query_one("#activity-panel", ActivityPanel)
-        pbar = self.query_one("#download-progress", ProgressBar)
+        dl_panel = self.query_one("#download-panel", DownloadPanel)
         task_id = "download"
 
         panel.add_task(task_id, "[bold]Download:[/] collecting file list…")
@@ -672,72 +822,84 @@ class MyrientBrowser(App):
         all_files: list[Entry] = []
         for entry in targets:
             if entry.is_dir:
-                panel.update_task(task_id, f"[bold]Download:[/] scanning [italic]{entry.display_name}[/]…")
+                panel.update_task(
+                    task_id,
+                    f"[bold]Download:[/] scanning [italic]{entry.display_name}[/]…",
+                )
                 sub = await scraper.collect_files(entry.url)
                 all_files.extend(sub)
             else:
                 all_files.append(entry)
 
+        panel.finish_task(task_id)
+
         if not all_files:
             sb.status_msg = "No files found to download."
-            panel.finish_task(task_id)
             return
 
         total_count = len(all_files)
         total_bytes = sum(e.size_bytes for e in all_files if e.size_bytes is not None)
-        unknown = sum(1 for e in all_files if e.size_bytes is None)
-        size_label = format_size(total_bytes) + (f" + {unknown} unknown" if unknown else "")
+        dl_panel.start(total_count, total_bytes, dest_root)
+        sb.status_msg = (
+            f"Downloading {total_count} files  "
+            f"({format_size(total_bytes)})  → {dest_root}/"
+        )
 
-        # Show the progress bar
-        pbar.update(total=total_count, progress=0)
-        pbar.display = True
+        def _folder_label(url: str) -> str:
+            """Return the last 1–2 folder segments as a breadcrumb label."""
+            parts = [
+                unquote(p)
+                for p in urlparse(url).path.split("/")
+                if p and p != "files"
+            ]
+            # parts[-1] is the filename; parts[:-1] are the directories
+            dirs = parts[:-1]
+            return " › ".join(dirs[-2:]) if dirs else ""
 
-        sb.status_msg = f"Downloading {total_count} files  ({size_label})  → {dest_root}/"
-
-        # Download with limited concurrency
-        sem = asyncio.Semaphore(4)
-        done = 0
-        errors = 0
+        sem = asyncio.Semaphore(3)  # 3 concurrent downloads
+        counters = {"skipped": 0, "errors": 0}
 
         async def _dl(entry: Entry) -> None:
-            nonlocal done, errors
+            key = entry.url
+            folder = _folder_label(key)
             async with sem:
+                dl_panel.file_start(key, entry.name, folder, entry.size_bytes or 0)
                 try:
-                    await scraper.download_entry(entry, dest_root)
+                    def _progress(done_bytes: int, total_bytes: int) -> None:
+                        dl_panel.file_progress(key, done_bytes, total_bytes)
+
+                    was_skipped = await scraper.download_entry(
+                        entry, dest_root, progress_callback=_progress
+                    )
+                    counters["skipped"] += int(was_skipped)
+                    dl_panel.file_done(key, skipped=was_skipped, error=False)
                 except Exception as exc:
-                    errors += 1
+                    counters["errors"] += 1
+                    dl_panel.file_done(key, skipped=False, error=True)
                     self.notify(
-                        f"Failed to download {entry.name}:\n{exc}",
+                        f"Failed: {entry.name}\n{exc}",
                         title="Download error",
                         severity="warning",
-                    )
-                finally:
-                    done += 1
-                    pbar.update(progress=done)
-                    err_note = f"  [red]({errors} errors)[/]" if errors else ""
-                    panel.update_task(
-                        task_id,
-                        f"[bold]Download:[/] {done}/{total_count} files"
-                        f"  {_prog_bar(done, total_count, 20)}"
-                        f"  [dim]→ {dest_root}/[/]{err_note}",
                     )
 
         await asyncio.gather(*[_dl(e) for e in all_files])
 
-        pbar.display = False
-        panel.finish_task(task_id)
+        dl_panel.finish()
 
-        saved = done - errors
+        n_err = counters["errors"]
+        n_skip = counters["skipped"]
+        n_new = total_count - n_err - n_skip
+        summary = f"{n_new} new"
+        if n_skip:
+            summary += f"  +  {n_skip} skipped"
+        if n_err:
+            summary += f"  +  {n_err} errors"
         self.notify(
-            f"{saved}/{total_count} files saved to {dest_root}/"
-            + (f"\n{errors} errors" if errors else ""),
-            title="Download complete" if not errors else "Download finished with errors",
-            severity="information" if not errors else "warning",
+            f"{summary}\n→ {dest_root}/",
+            title="Download complete" if not n_err else "Download finished with errors",
+            severity="information" if not n_err else "warning",
         )
-        sb.status_msg = (
-            f"Done: {saved}/{total_count} files saved to {dest_root}/"
-            + (f"  ({errors} errors)" if errors else "")
-        )
+        sb.status_msg = f"Done — {summary}  → {dest_root}/"
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

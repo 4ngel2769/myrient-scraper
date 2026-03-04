@@ -352,11 +352,17 @@ async def download_entry(
     entry: "Entry",
     dest_root: str,
     progress_callback=None,
-) -> int:
+) -> bool:
     """
     Stream-download a single file entry to dest_root, mirroring the remote
     directory structure.  Skips the file if it already exists with the correct
-    size.  Returns the number of bytes written (0 if skipped).
+    size.
+
+    progress_callback(done_bytes: int, total_bytes: int) is called synchronously
+    per 64 KiB chunk while downloading.
+
+    Returns True if the file was skipped (already present), False if downloaded.
+    Raises on HTTP / IO errors.
     """
     from pathlib import Path
     from urllib.parse import urlparse
@@ -365,9 +371,9 @@ async def download_entry(
 
     parsed = urlparse(entry.url)
     rel = parsed.path.lstrip("/")
-    # Strip the leading "files/" segment so downloads land in dest_root/<collection>/…
-    if rel.startswith("files/"):
-        rel = rel[len("files/"):]
+    # Keep the full remote path but root it under "myrient/" so the layout is:
+    #   downloads/myrient/files/<collection>/<subfolders>/<file>
+    rel = "myrient/" + rel
 
     local_path = Path(dest_root) / rel
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -378,21 +384,21 @@ async def download_entry(
         and entry.size_bytes is not None
         and local_path.stat().st_size == entry.size_bytes
     ):
-        if progress_callback:
-            await progress_callback(entry, local_path, skipped=True)
-        return 0
+        return True  # skipped
 
     client = _get_client()
     async with client.stream("GET", entry.url, timeout=None) as resp:
         resp.raise_for_status()
+        total = int(resp.headers.get("content-length", entry.size_bytes or 0))
+        done = 0
         with open(local_path, "wb") as fh:
             async for chunk in resp.aiter_bytes(65_536):
                 fh.write(chunk)
+                done += len(chunk)
+                if progress_callback:
+                    progress_callback(done, total)
 
-    written = local_path.stat().st_size
-    if progress_callback:
-        await progress_callback(entry, local_path, skipped=False)
-    return written
+    return False  # downloaded
 
 
 async def close():
