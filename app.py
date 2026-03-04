@@ -21,8 +21,10 @@ Key bindings:
     Q              Quit
 
 Search bar (Ctrl+F):
-    Typing instantly fuzzy-filters the current directory.
-    Pressing Enter launches a deep recursive search from the current directory.
+    The app indexes the entire archive in the background on startup.
+    Typing instantly searches ALL indexed entries (files + folders) site-wide.
+    Results show the folder path so you know exactly where each ROM lives.
+    While indexing is still running, partial results are shown immediately.
     Clicking or pressing Enter on a result navigates to its parent folder.
     Space / D work normally on search results to select+download.
 
@@ -493,6 +495,10 @@ class MyrientBrowser(App):
     _browse_url_saved: str = BASE_URL
     _browse_entries_saved: list  # list[Entry], saved when entering search
     _result_parent_urls: list   # list[str], parallel to _current_entries in search mode
+    # Global site index — built in background on startup
+    _index: list               # list of (Entry, parent_url) for every entry site-wide
+    _index_ready: bool = False
+    _index_building: bool = False
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -518,7 +524,7 @@ class MyrientBrowser(App):
             with Vertical(id="files-panel"):
                 yield Label(" /files/", id="files-title")
                 yield Input(
-                    placeholder="  Type to filter  ·  Enter = deep recursive search  ·  Esc = close",
+                    placeholder="  Type to search all indexed entries  ·  Esc = close",
                     id="search-input",
                 )
                 yield Label("", id="search-label")
@@ -535,14 +541,18 @@ class MyrientBrowser(App):
     # ── Startup ───────────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
-        """Load the root directory when the app starts."""
+        """Load the root directory and kick off background site indexing."""
         self._selected_keys = set()
         self._search_mode = False
         self._browse_url_saved = BASE_URL
         self._browse_entries_saved = []
         self._result_parent_urls = []
+        self._index = []
+        self._index_ready = False
+        self._index_building = False
         self._load_into_tree(self.query_one("#dir-tree", Tree).root)
         self._load_table(BASE_URL)
+        self._build_site_index()  # start crawling the whole archive in background
 
     # ── Tree events ───────────────────────────────────────────────────────────
 
@@ -626,34 +636,53 @@ class MyrientBrowser(App):
 
     @on(Input.Changed, "#search-input")
     def on_search_input_changed(self, event: Input.Changed) -> None:
-        """Live-filter current directory entries as the user types."""
+        """Search the global index as the user types."""
         query = event.value.strip()
         if not query:
-            # Restore the saved browse view (cached, instant)
             self._search_mode = False
             self._result_parent_urls = []
             self.query_one("#search-label", Label).display = False
             self._load_table(self._browse_url_saved)
             return
+
+        # Use the full site index if anything has been indexed; fall back to
+        # current-directory entries while the index is still empty.
+        src = self._index if self._index else [
+            (e, self._browse_url_saved) for e in self._browse_entries_saved
+        ]
         scored = [
-            (e, _fuzzy_score(query, e.name))
-            for e in self._browse_entries_saved
+            (e, parent_url, _fuzzy_score(query, e.name))
+            for e, parent_url in src
         ]
         matches = [
-            (e, self._browse_url_saved)
-            for e, sc in sorted(scored, key=lambda t: t[1], reverse=True)
+            (e, parent_url)
+            for e, parent_url, sc in sorted(scored, key=lambda t: t[2], reverse=True)
             if sc > 0
-        ]
+        ][:500]
         self._show_search_results(matches, query)
+
+        # Overlay a status hint when the index is still being built
+        if self._index_building:
+            search_label = self.query_one("#search-label", Label)
+            n = len(self._index)
+            search_label.update(
+                f"[yellow]⚡ Indexing in progress — {n:,} entries so far[/]  "
+                "[dim](results update as more is indexed)[/]  "
+                "[dim]Esc=back  Space=select  D=download[/]"
+            )
+            search_label.display = True
 
     @on(Input.Submitted, "#search-input")
     def on_search_input_submitted(self, event: Input.Submitted) -> None:
-        """Launch a deep recursive search when Enter is pressed."""
+        """Move focus to the results table on Enter (search is already live)."""
         query = event.value.strip()
         if not query:
             self.action_close_search()
             return
-        self._run_deep_search(query, self._browse_url_saved)
+        # If the index hasn't started building yet, kick it off now
+        if not self._index_building and not self._index_ready:
+            self._build_site_index()
+        self.query_one("#file-table", DataTable).focus()
 
     # ── Key Actions ───────────────────────────────────────────────────────────
 
@@ -899,7 +928,9 @@ class MyrientBrowser(App):
         else:
             sb.selected_size = "—"
 
-        table.focus()
+        # Only move focus to the table if the search bar isn't currently open
+        if not self.query_one("#search-input", Input).display:
+            table.focus()
 
     @work(exclusive=False, thread=False)
     async def _start_size_calc(self, url: str, label: str) -> None:
@@ -1065,21 +1096,25 @@ class MyrientBrowser(App):
         sb.status_msg = f"Done — {summary}  → {dest_root}/"
 
     @work(exclusive=False, thread=False)
-    async def _run_deep_search(self, query: str, base_url: str) -> None:
+    async def _build_site_index(self) -> None:
         """
-        Recursively crawl the archive from *base_url* and collect every entry
-        whose name fuzzy-matches *query*.  Results are streamed into the table
-        via _show_search_results() once the crawl is done.
+        Crawl the entire Myrient archive and build an in-memory index of every
+        entry (file + directory) with its parent URL.  Runs automatically on
+        startup.  Uses 20 concurrent fetches so it finishes in minutes, not hours.
+        While building, the search bar already returns partial results.
         """
-        panel = self.query_one("#activity-panel", ActivityPanel)
-        search_label = self.query_one("#search-label", Label)
-        task_id = "search"
-        panel.add_task(task_id, f"[bold]Search:[/] scanning for [italic]{query}[/]\u2026")
+        if self._index_building or self._index_ready:
+            return
+        self._index_building = True
+        self._index = []
 
-        results: list[tuple] = []   # (Entry, parent_url)
+        panel = self.query_one("#activity-panel", ActivityPanel)
+        task_id = "site_index"
+        panel.add_task(task_id, "[bold]Indexing:[/] connecting to archive\u2026")
+
         visited: set[str] = set()
+        sem = asyncio.Semaphore(20)
         dirs_scanned = [0]
-        sem = asyncio.Semaphore(8)  # up to 8 concurrent directory fetches
 
         async def _scan(url: str) -> None:
             if url in visited:
@@ -1087,49 +1122,54 @@ class MyrientBrowser(App):
             visited.add(url)
             async with sem:
                 dirs_scanned[0] += 1
-                panel.update_task(
-                    task_id,
-                    f"[bold]Search:[/] [italic]{query}[/]  \u2014  "
-                    f"{dirs_scanned[0]} dirs, {len(results)} matches\u2026",
-                )
+                if dirs_scanned[0] % 20 == 0:
+                    panel.update_task(
+                        task_id,
+                        f"[bold]Indexing:[/] "
+                        f"{dirs_scanned[0]} dirs  \u00b7  {len(self._index):,} entries\u2026",
+                    )
                 try:
                     entries = await fetch_directory(url)
                 except Exception:
                     return
             sub: list = []
             for entry in entries:
-                if _fuzzy_score(query, entry.name) > 0:
-                    results.append((entry, url))
+                self._index.append((entry, url))
                 if entry.is_dir:
                     sub.append(_scan(entry.url))
             if sub:
                 await asyncio.gather(*sub)
 
-        await _scan(base_url)
-        panel.finish_task(task_id)
-
-        if not self._search_mode:
-            # User pressed Esc before the crawl finished — discard results
-            return
-
-        # Sort: files first (ROMs), then directories; within each group by score desc
-        results.sort(
-            key=lambda t: (t[0].is_dir, -_fuzzy_score(query, t[0].name))
-        )
-        results = results[:300]  # cap at 300 results
-
-        if results:
-            self._show_search_results(results, query)
+        try:
+            await _scan(BASE_URL)
+            self._index_ready = True
+            panel.finish_task(task_id)
+            n = len(self._index)
             self.notify(
-                f"{len(results)} result{'s' if len(results) != 1 else ''} for {query!r}",
+                f"{n:,} entries indexed — Ctrl+F to search",
+                title="Index ready",
                 severity="information",
             )
-        else:
-            search_label.update(
-                f"[dim]No results for [/][bold]{query!r}[/][dim]  \u2014  Esc to go back[/]"
-            )
-            search_label.display = True
-            self.notify(f"No results for {query!r}", severity="warning")
+            # If the search bar is open, refresh results with the full index
+            search_input = self.query_one("#search-input", Input)
+            if self._search_mode and search_input.display:
+                q = search_input.value.strip()
+                if q:
+                    scored = [
+                        (e, pu, _fuzzy_score(q, e.name))
+                        for e, pu in self._index
+                    ]
+                    matches = [
+                        (e, pu)
+                        for e, pu, sc in sorted(scored, key=lambda t: t[2], reverse=True)
+                        if sc > 0
+                    ][:500]
+                    self._show_search_results(matches, q)
+        except Exception as exc:
+            panel.finish_task(task_id)
+            self.notify(str(exc), title="Indexing error", severity="error")
+        finally:
+            self._index_building = False
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1174,7 +1214,7 @@ class MyrientBrowser(App):
         n = len(results)
         title_label.update(f" \U0001f50d {query!r}  —  {n} result{'s' if n != 1 else ''}")
         search_label.update(
-            "[dim]Enter[/]=deep search  [dim]Esc[/]=back  "
+            "[dim]Enter[/]=focus results  [dim]Esc[/]=back  "
             "[dim]Space[/]=select  [dim]D[/]=download  "
             "[dim]Enter on row[/]=navigate to folder"
         )
@@ -1195,8 +1235,8 @@ class MyrientBrowser(App):
                 ext = entry.name.rsplit(".", 1)[-1].upper() if "." in entry.name else "—"
                 type_cell = f"[dim]{ext}[/]"
             table.add_row(name_cell, size_cell, entry.date or "—", type_cell, key=str(i))
-
-        table.focus()
+            
+        # focus is moved to the table only when the user presses Enter.
 
     def _refresh_name_cells(self) -> None:
         """Redraw the Name column for every entry row to reflect current selections."""
