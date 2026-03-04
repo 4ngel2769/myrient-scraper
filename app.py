@@ -7,17 +7,25 @@ Usage:
 
 Key bindings:
     ↑ / ↓         Navigate list
-    Enter / Space  Open directory / expand tree node
+    Enter          Open directory
+    Space          Toggle selection on highlighted item
+    A              Select / deselect all items in current directory
+    D              Download selected items (recursive for dirs; prompts size first)
     S              Calculate size of selected item (recursive)
     G              Calculate GRAND TOTAL of entire archive
     R              Refresh current directory
     C              Copy current URL to clipboard
+    Backspace      Go up one directory
     Q              Quit
+
+Downloads are written to ./downloads/ (mirroring the remote path).
+Already-downloaded files at the correct size are skipped automatically.
 """
 
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Optional
 
 from textual import work, on
@@ -30,6 +38,7 @@ from textual.widgets import (
     Footer,
     Header,
     Label,
+    ProgressBar,
     Static,
     Tree,
 )
@@ -37,6 +46,68 @@ from textual.widgets.tree import TreeNode
 
 import scraper
 from scraper import Entry, BASE_URL, format_size, fetch_directory
+
+# ── Activity Panel ────────────────────────────────────────────────────────────
+
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _prog_bar(done: int, total: int, width: int = 24) -> str:
+    """Render a Unicode block progress bar as Rich markup."""
+    if total <= 0:
+        return f"[dim]{'░' * width}[/]"
+    filled = min(int(done / total * width), width)
+    pct = int(done / total * 100)
+    bar = f"[green]{'█' * filled}[/][dim]{'░' * (width - filled)}[/]"
+    return f"{bar} [bold]{pct}%[/]"
+
+
+class ActivityPanel(Static):
+    """
+    Collapsible panel pinned above the footer.  Hidden when idle;
+    auto-appears when background tasks register themselves.
+
+    Each task is a dict entry:  task_id -> (spinner_idx, label_text)
+    Call add_task / update_task / finish_task from workers.
+    """
+
+    # task_id -> {"spin": int, "text": str}
+    def __init__(self) -> None:
+        super().__init__("")
+        self._tasks: dict[str, dict] = {}
+
+    def add_task(self, task_id: str, text: str) -> None:
+        self._tasks[task_id] = {"spin": 0, "text": text}
+        self.display = True
+        self._rebuild()
+
+    def update_task(self, task_id: str, text: str) -> None:
+        if task_id not in self._tasks:
+            return
+        d = self._tasks[task_id]
+        d["spin"] = (d["spin"] + 1) % len(_SPINNER_FRAMES)
+        d["text"] = text
+        self._rebuild()
+
+    def finish_task(self, task_id: str) -> None:
+        self._tasks.pop(task_id, None)
+        if self._tasks:
+            self._rebuild()
+        else:
+            self.update("")
+            self.display = False
+
+    def _rebuild(self) -> None:
+        lines: list[str] = []
+        n = len(self._tasks)
+        lines.append(
+            f"[bold yellow]⚡ {n} task{'s' if n != 1 else ''} running[/]"
+            "  [dim]— the app stays usable, browse freely[/]"
+        )
+        for d in self._tasks.values():
+            spin = _SPINNER_FRAMES[d["spin"]]
+            lines.append(f" [cyan]{spin}[/]  {d['text']}")
+        self.update("\n".join(lines))
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -162,11 +233,30 @@ class MyrientBrowser(App):
         text-align: center;
         padding: 0 1;
     }
+
+    ActivityPanel {
+        height: auto;
+        max-height: 10;
+        background: $surface-darken-2;
+        border-top: solid $accent;
+        padding: 0 1;
+        display: none;
+    }
+
+    #download-progress {
+        height: 1;
+        background: $surface-darken-2;
+        padding: 0 2;
+        display: none;
+    }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
+        Binding("space", "toggle_select", "Select"),
+        Binding("a", "select_all", "Sel All"),
+        Binding("d", "download", "Download"),
         Binding("s", "calc_size", "Calc Size"),
         Binding("g", "calc_grand_total", "Grand Total"),
         Binding("c", "copy_url", "Copy URL"),
@@ -181,6 +271,12 @@ class MyrientBrowser(App):
     _current_entries: list[Entry] = []
     _selected_entry: Optional[Entry] = None
     _loading: bool = False
+    # Multi-select: row keys (str) of items checked with Space
+    _selected_keys: set
+    # Stored column key for the "Name" column (set in compose)
+    _name_col_key: object
+    # Destination root for downloads
+    _download_dir: str = "downloads"
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -206,21 +302,20 @@ class MyrientBrowser(App):
             with Vertical(id="files-panel"):
                 yield Label(" /files/", id="files-title")
                 table = DataTable(id="file-table", cursor_type="row")
-                table.add_columns(
-                    "Name",
-                    "Size",
-                    "Date",
-                    "Type",
-                )
+                col_keys = table.add_columns("Name", "Size", "Date", "Type")
+                self._name_col_key = col_keys[0]
                 yield table
 
         yield StatusBar(id="status-bar")
+        yield ActivityPanel(id="activity-panel")
+        yield ProgressBar(total=100, id="download-progress", show_eta=False)
         yield Footer()
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
         """Load the root directory when the app starts."""
+        self._selected_keys = set()
         self._load_into_tree(self.query_one("#dir-tree", Tree).root)
         self._load_table(BASE_URL)
 
@@ -346,6 +441,57 @@ class MyrientBrowser(App):
         self._load_table(parent)
         self._sync_tree_selection(parent)
 
+    def action_toggle_select(self) -> None:
+        """Toggle the multi-select checkmark on the highlighted row."""
+        table = self.query_one("#file-table", DataTable)
+        if table.cursor_row is None:
+            return
+        cell_key = table.coordinate_to_cell_key(table.cursor_coordinate)
+        rk = str(cell_key.row_key.value)
+        if rk in ("__parent__", "err"):
+            return
+        idx = int(rk)
+        if idx >= len(self._current_entries):
+            return
+        entry = self._current_entries[idx]
+        if rk in self._selected_keys:
+            self._selected_keys.discard(rk)
+        else:
+            self._selected_keys.add(rk)
+        name_val = self._make_name_cell(entry, rk in self._selected_keys)
+        table.update_cell(rk, self._name_col_key, name_val)
+        self._update_select_status()
+
+    def action_select_all(self) -> None:
+        """Toggle: select all items if not all selected, else deselect all."""
+        all_keys = {str(i) for i in range(len(self._current_entries))}
+        if all_keys.issubset(self._selected_keys):
+            self._selected_keys -= all_keys   # deselect all
+        else:
+            self._selected_keys |= all_keys   # select all
+        self._refresh_name_cells()
+        self._update_select_status()
+
+    def action_download(self) -> None:
+        """Download all selected items (or the highlighted item if nothing selected)."""
+        targets: list[Entry] = []
+        if self._selected_keys:
+            for rk in sorted(self._selected_keys, key=lambda k: int(k)):
+                idx = int(rk)
+                if idx < len(self._current_entries):
+                    targets.append(self._current_entries[idx])
+        elif self._selected_entry is not None:
+            targets = [self._selected_entry]
+        else:
+            # Download entire current directory
+            targets = list(self._current_entries)
+
+        if not targets:
+            self.query_one("#status-bar", StatusBar).status_msg = "Nothing to download."
+            return
+
+        self._run_download(targets, self._download_dir)
+
     # ── Workers (async background tasks) ─────────────────────────────────────
 
     @work(exclusive=False, thread=False)
@@ -391,6 +537,7 @@ class MyrientBrowser(App):
 
         self._current_entries = entries
         self._current_url = url
+        self._selected_keys = set()  # clear selections on navigation
         label_path = url_to_label(url) or "/files"
         title_label.update(f" {label_path}/")
         sb.current_path = label_path + "/"
@@ -412,8 +559,7 @@ class MyrientBrowser(App):
 
         # Fill table rows
         for i, entry in enumerate(entries):
-            icon = "\U0001f4c1" if entry.is_dir else _file_icon(entry.name)
-            name_cell = f"{icon} {entry.display_name}"
+            name_cell = self._make_name_cell(entry, False)
 
             if entry.is_dir:
                 size_cell = "[dim cyan]—[/]"
@@ -448,29 +594,192 @@ class MyrientBrowser(App):
     async def _start_size_calc(self, url: str, label: str) -> None:
         """Recursively calculate the total size of a directory."""
         sb = self.query_one("#status-bar", StatusBar)
+        panel = self.query_one("#activity-panel", ActivityPanel)
+        task_id = f"size_{id(url)}"
         sb.selected_size = "calculating…"
-        sb.status_msg = f"Calculating size of {label}…"
+        panel.add_task(task_id, f"[bold]Size calc:[/] {label}  scanning…")
+
+        dirs_scanned = [0]
+
+        async def _progress(scanned_url: str, _bytes: int) -> None:
+            dirs_scanned[0] += 1
+            panel.update_task(
+                task_id,
+                f"[bold]Size calc:[/] {label}  "
+                f"[dim]{dirs_scanned[0]} dir{'s' if dirs_scanned[0] != 1 else ''} scanned…[/]",
+            )
+
         try:
-            total = await scraper.calculate_dir_size(url)
+            total = await scraper.calculate_dir_size(url, progress_callback=_progress)
             sb.selected_size = format_size(total)
             sb.status_msg = f"Size of {label}: {format_size(total)}"
+            self.notify(
+                f"{label}\n{format_size(total)}",
+                title="Size calculated",
+                severity="information",
+            )
         except Exception as exc:
             sb.selected_size = "error"
             sb.status_msg = f"Size calc error: {exc}"
+            self.notify(str(exc), title="Size calc error", severity="error")
+        finally:
+            panel.finish_task(task_id)
 
     @work(exclusive=False, thread=False)
     async def _run_grand_total(self) -> None:
         """Calculate the grand total of the entire archive."""
         sb = self.query_one("#status-bar", StatusBar)
+        panel = self.query_one("#activity-panel", ActivityPanel)
+        task_id = "grand_total"
+        panel.add_task(task_id, "[bold]Grand total:[/] scanning entire archive…")
+
+        dirs_scanned = [0]
+
+        async def _progress(scanned_url: str, _bytes: int) -> None:
+            dirs_scanned[0] += 1
+            panel.update_task(
+                task_id,
+                f"[bold]Grand total:[/] {dirs_scanned[0]} directories scanned…",
+            )
+
         try:
-            total = await scraper.calculate_dir_size(BASE_URL)
+            total = await scraper.calculate_dir_size(BASE_URL, progress_callback=_progress)
             sb.grand_total = format_size(total)
             sb.status_msg = f"Grand total: {format_size(total)}"
+            self.notify(
+                f"Total archive size: {format_size(total)}",
+                title="Grand total",
+                severity="information",
+            )
         except Exception as exc:
             sb.grand_total = "error"
             sb.status_msg = f"Grand total error: {exc}"
+            self.notify(str(exc), title="Grand total error", severity="error")
+        finally:
+            panel.finish_task(task_id)
+
+    @work(exclusive=False, thread=False)
+    async def _run_download(self, targets: list[Entry], dest_root: str) -> None:
+        """Collect files from targets (expanding dirs recursively), check size, then download."""
+        sb = self.query_one("#status-bar", StatusBar)
+        panel = self.query_one("#activity-panel", ActivityPanel)
+        pbar = self.query_one("#download-progress", ProgressBar)
+        task_id = "download"
+
+        panel.add_task(task_id, "[bold]Download:[/] collecting file list…")
+
+        # Expand all targeted dirs into individual file entries
+        all_files: list[Entry] = []
+        for entry in targets:
+            if entry.is_dir:
+                panel.update_task(task_id, f"[bold]Download:[/] scanning [italic]{entry.display_name}[/]…")
+                sub = await scraper.collect_files(entry.url)
+                all_files.extend(sub)
+            else:
+                all_files.append(entry)
+
+        if not all_files:
+            sb.status_msg = "No files found to download."
+            panel.finish_task(task_id)
+            return
+
+        total_count = len(all_files)
+        total_bytes = sum(e.size_bytes for e in all_files if e.size_bytes is not None)
+        unknown = sum(1 for e in all_files if e.size_bytes is None)
+        size_label = format_size(total_bytes) + (f" + {unknown} unknown" if unknown else "")
+
+        # Show the progress bar
+        pbar.update(total=total_count, progress=0)
+        pbar.display = True
+
+        sb.status_msg = f"Downloading {total_count} files  ({size_label})  → {dest_root}/"
+
+        # Download with limited concurrency
+        sem = asyncio.Semaphore(4)
+        done = 0
+        errors = 0
+
+        async def _dl(entry: Entry) -> None:
+            nonlocal done, errors
+            async with sem:
+                try:
+                    await scraper.download_entry(entry, dest_root)
+                except Exception as exc:
+                    errors += 1
+                    self.notify(
+                        f"Failed to download {entry.name}:\n{exc}",
+                        title="Download error",
+                        severity="warning",
+                    )
+                finally:
+                    done += 1
+                    pbar.update(progress=done)
+                    err_note = f"  [red]({errors} errors)[/]" if errors else ""
+                    panel.update_task(
+                        task_id,
+                        f"[bold]Download:[/] {done}/{total_count} files"
+                        f"  {_prog_bar(done, total_count, 20)}"
+                        f"  [dim]→ {dest_root}/[/]{err_note}",
+                    )
+
+        await asyncio.gather(*[_dl(e) for e in all_files])
+
+        pbar.display = False
+        panel.finish_task(task_id)
+
+        saved = done - errors
+        self.notify(
+            f"{saved}/{total_count} files saved to {dest_root}/"
+            + (f"\n{errors} errors" if errors else ""),
+            title="Download complete" if not errors else "Download finished with errors",
+            severity="information" if not errors else "warning",
+        )
+        sb.status_msg = (
+            f"Done: {saved}/{total_count} files saved to {dest_root}/"
+            + (f"  ({errors} errors)" if errors else "")
+        )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _make_name_cell(self, entry: Entry, selected: bool) -> str:
+        """Build the Name cell string with optional selection checkmark."""
+        icon = "\U0001f4c1" if entry.is_dir else _file_icon(entry.name)
+        check = "[bold green]✓[/] " if selected else "  "
+        return f"{check}{icon} {entry.display_name}"
+
+    def _refresh_name_cells(self) -> None:
+        """Redraw the Name column for every entry row to reflect current selections."""
+        table = self.query_one("#file-table", DataTable)
+        for i, entry in enumerate(self._current_entries):
+            rk = str(i)
+            name_val = self._make_name_cell(entry, rk in self._selected_keys)
+            try:
+                table.update_cell(rk, self._name_col_key, name_val)
+            except Exception:
+                pass
+
+    def _update_select_status(self) -> None:
+        sb = self.query_one("#status-bar", StatusBar)
+        n = len(self._selected_keys)
+        if n == 0:
+            sb.status_msg = ""
+        else:
+            # Show total known size of selected items
+            sel_entries = [
+                self._current_entries[int(k)]
+                for k in self._selected_keys
+                if int(k) < len(self._current_entries)
+            ]
+            known = sum(e.size_bytes for e in sel_entries if e.size_bytes)
+            dirs = sum(1 for e in sel_entries if e.is_dir)
+            files = sum(1 for e in sel_entries if not e.is_dir)
+            parts = []
+            if dirs:
+                parts.append(f"{dirs} dir{'s' if dirs != 1 else ''}")
+            if files:
+                parts.append(f"{files} file{'s' if files != 1 else ''}")
+            size_note = f"  ~{format_size(known)}" if known else ""
+            sb.status_msg = f"{n} selected ({', '.join(parts)}){size_note}  — press D to download"
 
     def _update_status_selection(self, entry: Entry) -> None:
         sb = self.query_one("#status-bar", StatusBar)

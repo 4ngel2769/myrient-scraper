@@ -315,10 +315,84 @@ async def calculate_dir_size(
             if isinstance(r, int):
                 total += r
 
-    if progress_callback and _depth == 0:
+    if progress_callback:
         await progress_callback(url, total)
 
     return total
+
+
+async def collect_files(url: str) -> list["Entry"]:
+    """
+    Recursively walk a directory URL and return every *file* Entry found.
+    Directories themselves are not included in the result.
+    """
+    result: list[Entry] = []
+    try:
+        entries = await fetch_directory(url)
+    except RuntimeError:
+        return result
+
+    tasks = []
+    for entry in entries:
+        if entry.is_dir:
+            tasks.append(collect_files(entry.url))
+        else:
+            result.append(entry)
+
+    if tasks:
+        sub_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in sub_results:
+            if isinstance(r, list):
+                result.extend(r)
+
+    return result
+
+
+async def download_entry(
+    entry: "Entry",
+    dest_root: str,
+    progress_callback=None,
+) -> int:
+    """
+    Stream-download a single file entry to dest_root, mirroring the remote
+    directory structure.  Skips the file if it already exists with the correct
+    size.  Returns the number of bytes written (0 if skipped).
+    """
+    from pathlib import Path
+    from urllib.parse import urlparse
+
+    assert not entry.is_dir, "download_entry() only handles files"
+
+    parsed = urlparse(entry.url)
+    rel = parsed.path.lstrip("/")
+    # Strip the leading "files/" segment so downloads land in dest_root/<collection>/…
+    if rel.startswith("files/"):
+        rel = rel[len("files/"):]
+
+    local_path = Path(dest_root) / rel
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Skip if already fully downloaded
+    if (
+        local_path.exists()
+        and entry.size_bytes is not None
+        and local_path.stat().st_size == entry.size_bytes
+    ):
+        if progress_callback:
+            await progress_callback(entry, local_path, skipped=True)
+        return 0
+
+    client = _get_client()
+    async with client.stream("GET", entry.url, timeout=None) as resp:
+        resp.raise_for_status()
+        with open(local_path, "wb") as fh:
+            async for chunk in resp.aiter_bytes(65_536):
+                fh.write(chunk)
+
+    written = local_path.stat().st_size
+    if progress_callback:
+        await progress_callback(entry, local_path, skipped=False)
+    return written
 
 
 async def close():
